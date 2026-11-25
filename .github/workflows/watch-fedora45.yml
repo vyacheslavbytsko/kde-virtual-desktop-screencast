@@ -1,0 +1,49 @@
+name: Check Fedora 45 for RPM updates
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency: fedora45-upstream-check
+
+jobs:
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:45
+    timeout-minutes: 15
+    steps:
+      - run: dnf -y install git curl python3 python3-rpm
+      - uses: actions/checkout@v7
+      - name: Check the official Fedora 45 repositories
+        shell: bash
+        run: |
+          set -o pipefail
+          dnf -q --refresh --repo=fedora,updates repoquery --available --latest-limit=1 \
+            --arch=x86_64 --queryformat '%{sourcerpm}\n' kwin xdg-desktop-portal-kde \
+            | python3 scripts/update-fedora45-source-pins.py
+      - name: Start a build if Fedora released a newer revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if git diff --quiet -- packaging/fedora/upstream-srpms.sha256; then
+            echo 'The Fedora source packages are already up to date.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add packaging/fedora/upstream-srpms.sha256
+          git commit -m 'Track updated Fedora 45 source RPMs'
+          git push origin HEAD:main
+          curl --fail-with-body --silent --show-error --retry 3 --request POST \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'Content-Type: application/json' \
+            --data '{"ref":"main"}' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/workflows/fedora45-pages.yml/dispatches"
