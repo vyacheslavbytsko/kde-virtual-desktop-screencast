@@ -1,0 +1,70 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Проверка захвата KWin</title>
+<style>
+  body { font: 1rem system-ui; max-width: 55rem; margin: 2rem auto; padding: 0 1rem; }
+  button, a { margin-right: 1rem; }
+  video { display: block; width: 100%; margin-top: 1rem; background: #181a20; }
+  #clock { font-size: clamp(2rem, 10vw, 7rem); font-variant-numeric: tabular-nums; }
+</style>
+<main id="capture">
+  <h1>Проверка захвата KWin</h1>
+  <p>Откройте таймер в отдельном окне браузера и переместите его на другой рабочий стол. В системном диалоге выберите окно таймера. Если стол с таймером скрыт, время в предпросмотре должно продолжать меняться.</p>
+  <a href="?target" target="_blank" rel="noopener">Открыть таймер</a>
+  <button id="start">Выбрать источник</button>
+  <button id="stop" disabled>Остановить</button>
+  <p id="status" role="status">Ожидание источника</p>
+  <video id="preview" autoplay muted playsinline></video>
+</main>
+<main id="target" hidden>
+  <h1>Таймер для захвата</h1>
+  <p id="clock"></p>
+</main>
+<script>
+  const byId = id => document.getElementById(id);
+  if (new URLSearchParams(location.search).has("target")) {
+    document.title = "Таймер для захвата KWin";
+    byId("capture").hidden = true;
+    byId("target").hidden = false;
+    const update = () => {
+      byId("clock").textContent = new Date().toLocaleTimeString("ru-RU");
+    };
+    update();
+    setInterval(update, 1000);
+  } else {
+    const start = byId("start");
+    const stop = byId("stop");
+    const status = byId("status");
+    const video = byId("preview");
+    let stream;
+
+    const finish = message => {
+      stream?.getTracks().forEach(track => track.stop());
+      stream = undefined;
+      video.srcObject = null;
+      start.disabled = false;
+      stop.disabled = true;
+      status.textContent = message;
+    };
+
+    start.onclick = async () => {
+      start.disabled = true;
+      status.textContent = "Ожидание выбора источника…";
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({video: true, audio: false});
+        const [track] = stream.getVideoTracks();
+        track.addEventListener("ended", () => finish("Трансляция завершена"), {once: true});
+        video.srcObject = stream;
+        stop.disabled = false;
+        status.textContent = "Идёт захват. Проверьте, меняется ли время в кадре.";
+      } catch (error) {
+        finish(`Захват не запустился (${error.name}). ${error.message}`);
+      }
+    };
+    stop.onclick = () => finish("Трансляция остановлена");
+  }
+</script>
+</html>

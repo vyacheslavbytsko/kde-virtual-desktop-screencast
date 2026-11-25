@@ -1,0 +1,270 @@
+--- a/src/outputsmodel.cpp
++++ b/src/outputsmodel.cpp
+@@ -6,7 +6,9 @@
+ 
+ #include "outputsmodel.h"
+ #include <KLocalizedString>
++#include <QDBusArgument>
+ #include <QDBusConnection>
++#include <QDBusVariant>
+ #include <QDBusMessage>
+ #include <QDBusPendingCallWatcher>
+ #include <QDBusReply>
+@@ -21,6 +23,7 @@
+ #include <ranges>
+ 
+ #include "debug.h"
++#include "waylandintegration.h"
+ #include "qwayland-kde-output-order-v1.h"
+ 
+ using namespace Qt::StringLiterals;
+@@ -92,6 +95,37 @@
+     }
+ 
+     const auto screens = qGuiApp->screens();
++
++    if (o & VirtualDesktopsIncluded && WaylandIntegration::supportsVirtualDesktop()) {
++        auto request = QDBusMessage::createMethodCall(u"org.kde.KWin"_s,
++                                                      u"/VirtualDesktopManager"_s,
++                                                      u"org.freedesktop.DBus.Properties"_s,
++                                                      u"Get"_s);
++        request << u"org.kde.KWin.VirtualDesktopManager"_s << u"desktops"_s;
++        const QDBusReply<QDBusVariant> reply = QDBusConnection::sessionBus().call(request, QDBus::Block, 1000);
++        const auto value = reply.value().variant();
++        if (reply.isValid() && value.metaType() == QMetaType::fromType<QDBusArgument>()) {
++            const auto argument = value.value<QDBusArgument>();
++            if (argument.currentSignature() == u"a(uss)"_s) {
++                argument.beginArray();
++                while (!argument.atEnd()) {
++                    uint position;
++                    QString id, name;
++                    argument.beginStructure();
++                    argument >> position >> id >> name;
++                    argument.endStructure();
++                    for (QScreen *screen : screens) {
++                        const auto label = i18nc("@item:inlistbox", "%1 — %2 (virtual desktop)", name, screen->name());
++                        Output desktop{Output::VirtualDesktop, nullptr, label, u"desktop:%1:%2"_s.arg(id, screen->name()), {}, nullptr};
++                        desktop.desktopId = id;
++                        desktop.desktopOutputName = screen->name();
++                        m_outputs.append(std::move(desktop));
++                    }
++                }
++                argument.endArray();
++            }
++        }
++    }
+ 
+     // Only show the full workspace if there's several outputs
+     if (screens.count() > 1 && (o & WorkspaceIncluded)) {
+@@ -355,6 +389,7 @@
+         return QStringLiteral("video-television-symbolic");
+     case Region:
+         return QStringLiteral("transform-crop-symbolic");
++    case VirtualDesktop:
+     case Virtual:
+         return QStringLiteral("window-duplicate-symbolic");
+     case Workspace:
+@@ -372,6 +407,8 @@
+     switch (m_outputType) {
+     case Workspace:
+         return i18nc("@info", "Share the entire workspace across all screens");
++    case VirtualDesktop:
++        return i18nc("@info", "Share windows on this virtual desktop");
+     case Virtual:
+         return i18nc("@info", "Create a virtual screen, then share");
+     case Region:
+@@ -392,6 +429,7 @@
+     case Output::Workspace:
+     case Output::Region:
+     case Output::Virtual:
++    case Output::VirtualDesktop:
+         return true;
+     case Output::Laptop:
+     case Output::Monitor:
+--- a/src/outputsmodel.h
++++ b/src/outputsmodel.h
+@@ -25,6 +25,7 @@
+         Workspace,
+         Virtual,
+         Region,
++        VirtualDesktop,
+     };
+ 
+     Output(OutputType outputType,
+@@ -60,6 +61,9 @@
+     {
+         return m_display;
+     }
++
++    QString desktopId;
++    QString desktopOutputName;
+ 
+     QString uniqueId() const
+     {
+@@ -107,7 +111,8 @@
+         WorkspaceIncluded = 0x1,
+         VirtualIncluded = 0x2,
+         RegionIncluded = 0x4,
+-        OutputsExcluded = 0x8
++        OutputsExcluded = 0x8,
++        VirtualDesktopsIncluded = 0x10
+     };
+     Q_ENUM(Option)
+     Q_DECLARE_FLAGS(Options, Option)
+--- a/src/screencast.cpp
++++ b/src/screencast.cpp
+@@ -217,6 +217,7 @@
+                                                const QSize &virtualScreenSize,
+                                                bool allowRestore)
+ {
++    allowRestore &= !std::ranges::contains(selectedOutputs, Output::VirtualDesktop, &Output::outputType);
+     QVariantList outputs;
+     QList<WindowRestoreInfo> windows;
+     QList<QFuture<std::unique_ptr<ScreencastingStream>>> streams;
+@@ -230,6 +231,12 @@
+         case Output::Workspace:
+             stream = WaylandIntegration::startStreamingWorkspace(cursorMode);
+             break;
++        case Output::VirtualDesktop: {
++            const auto screens = QGuiApplication::screens();
++            const auto screen = std::ranges::find(screens, output.desktopOutputName, &QScreen::name);
++            stream = WaylandIntegration::startStreamingVirtualDesktop(output.desktopId, screen == screens.end() ? nullptr : *screen, cursorMode);
++            break;
++        }
+         case Output::Virtual: {
+             const QString outputName = session->appId().isEmpty()
+                 ? i18n("Virtual Output")
+--- a/src/screencasting.cpp
++++ b/src/screencasting.cpp
+@@ -23,7 +23,7 @@
+ using namespace KWayland::Client;
+ using namespace Qt::StringLiterals;
+ 
+-constexpr int implementedVersion = 6;
++constexpr int implementedVersion = 8;
+ 
+ class ScreencastingStreamPrivate : public QtWayland::zkde_screencast_stream_unstable_v1
+ {
+@@ -129,6 +129,37 @@
+ }
+ 
+ Screencasting::~Screencasting() = default;
++
++bool Screencasting::supportsVirtualDesktop() const
++{
++    return d && zkde_screencast_unstable_v1_get_version(d->object()) >= ZKDE_SCREENCAST_UNSTABLE_V1_STREAM_VIRTUAL_DESKTOP_SINCE_VERSION;
++}
++
++ScreencastingStream *Screencasting::createVirtualDesktopStream(const QString &desktopId, QScreen *screen, CursorMode mode)
++{
++    if (!supportsVirtualDesktop() || !screen) {
++        return nullptr;
++    }
++
++    auto native = qGuiApp->platformNativeInterface();
++    auto *output = reinterpret_cast<wl_output *>(native->nativeResourceForScreen(QByteArrayLiteral("output"), screen));
++    if (!output) {
++        return nullptr;
++    }
++
++    auto stream = new ScreencastingStream(this);
++    if (zkde_screencast_unstable_v1_get_version(d->object()) >= ZKDE_SCREENCAST_UNSTABLE_V1_STREAM_VIRTUAL_DESKTOP_WITH_CURSOR_SINCE_VERSION) {
++        stream->d->init(d->stream_virtual_desktop_with_cursor(desktopId, output, mode));
++    } else {
++        stream->d->init(d->stream_virtual_desktop(desktopId, output));
++    }
++    stream->d->m_geometry = screen->geometry();
++    stream->d->metaData = {
++        {u"size"_s, screen->size()},
++        {u"source_type"_s, static_cast<uint>(ScreenCastPortal::Monitor)},
++    };
++    return stream;
++}
+ 
+ ScreencastingStream *Screencasting::createOutputStream(QScreen *screen, CursorMode mode)
+ {
+--- a/src/screencasting.h
++++ b/src/screencasting.h
+@@ -64,6 +64,8 @@
+     };
+     Q_ENUM(CursorMode)
+ 
++    bool supportsVirtualDesktop() const;
++    ScreencastingStream *createVirtualDesktopStream(const QString &desktopId, QScreen *screen, CursorMode mode);
+     ScreencastingStream *createOutputStream(QScreen *screen, CursorMode mode);
+     ScreencastingStream *createWindowStream(const KWayland::Client::PlasmaWindow *window, CursorMode mode);
+     ScreencastingStream *createRegionStream(const QRect &geometry, qreal scale, CursorMode mode);
+--- a/src/screenchooserdialog.cpp
++++ b/src/screenchooserdialog.cpp
+@@ -166,7 +166,7 @@
+         // If the app requests only monitor we still allow the user to create a virtual one
+         OutputsModel::Options options = OutputsModel::VirtualIncluded;
+         if (types & ScreenCastPortal::Monitor) {
+-            options |= OutputsModel::WorkspaceIncluded | OutputsModel::RegionIncluded;
++            options |= OutputsModel::WorkspaceIncluded | OutputsModel::RegionIncluded | OutputsModel::VirtualDesktopsIncluded;
+         } else {
+             options |= OutputsModel::OutputsExcluded;
+         }
+--- a/src/waylandintegration.cpp
++++ b/src/waylandintegration.cpp
+@@ -73,6 +73,16 @@
+     globalWaylandIntegration->acquireStreamingInput(acquire);
+ }
+ 
++bool WaylandIntegration::supportsVirtualDesktop()
++{
++    return globalWaylandIntegration->supportsVirtualDesktop();
++}
++
++QFuture<std::unique_ptr<ScreencastingStream>> WaylandIntegration::startStreamingVirtualDesktop(const QString &desktopId, QScreen *screen, Screencasting::CursorMode mode)
++{
++    return globalWaylandIntegration->startStreamingVirtualDesktop(desktopId, screen, mode);
++}
++
+ QFuture<std::unique_ptr<ScreencastingStream>> WaylandIntegration::startStreamingOutput(QScreen *screen, Screencasting::CursorMode mode)
+ {
+     return globalWaylandIntegration->startStreamingOutput(screen, mode);
+@@ -205,6 +215,21 @@
+                                                                                                                   Screencasting::CursorMode cursorMode)
+ {
+     return startStreaming(m_screencasting->createWindowStream(window, cursorMode));
++}
++
++bool WaylandIntegration::WaylandIntegrationPrivate::supportsVirtualDesktop() const
++{
++    return m_screencasting && m_screencasting->supportsVirtualDesktop();
++}
++
++QFuture<std::unique_ptr<ScreencastingStream>> WaylandIntegration::WaylandIntegrationPrivate::startStreamingVirtualDesktop(const QString &desktopId, QScreen *screen, Screencasting::CursorMode mode)
++{
++    if (supportsVirtualDesktop()) {
++        if (auto stream = m_screencasting->createVirtualDesktopStream(desktopId, screen, mode)) {
++            return startStreaming(stream);
++        }
++    }
++    return QtFuture::makeReadyValueFuture(std::unique_ptr<ScreencastingStream>());
+ }
+ 
+ QFuture<std::unique_ptr<ScreencastingStream>> WaylandIntegration::WaylandIntegrationPrivate::startStreamingOutput(QScreen *screen,
+--- a/src/waylandintegration.h
++++ b/src/waylandintegration.h
+@@ -46,6 +46,8 @@
+ 
+ void acquireStreamingInput(bool acquire);
+ 
++bool supportsVirtualDesktop();
++QFuture<std::unique_ptr<ScreencastingStream>> startStreamingVirtualDesktop(const QString &desktopId, QScreen *screen, Screencasting::CursorMode mode);
+ QFuture<std::unique_ptr<ScreencastingStream>> startStreamingOutput(QScreen *screen, Screencasting::CursorMode mode);
+ QFuture<std::unique_ptr<ScreencastingStream>> startStreamingWorkspace(Screencasting::CursorMode mode);
+ QFuture<std::unique_ptr<ScreencastingStream>>
+--- a/src/waylandintegration_p.h
++++ b/src/waylandintegration_p.h
+@@ -70,6 +70,8 @@
+ 
+     void acquireStreamingInput(bool acquire);
+ 
++    bool supportsVirtualDesktop() const;
++    QFuture<std::unique_ptr<ScreencastingStream>> startStreamingVirtualDesktop(const QString &desktopId, QScreen *screen, Screencasting::CursorMode mode);
+     QFuture<std::unique_ptr<ScreencastingStream>> startStreamingOutput(QScreen *screen, Screencasting::CursorMode mode);
+     QFuture<std::unique_ptr<ScreencastingStream>> startStreamingWindow(KWayland::Client::PlasmaWindow *window, Screencasting::CursorMode mode);
+     QFuture<std::unique_ptr<ScreencastingStream>> startStreamingWorkspace(Screencasting::CursorMode mode);

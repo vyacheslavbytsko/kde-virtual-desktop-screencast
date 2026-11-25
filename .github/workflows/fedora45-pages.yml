@@ -1,0 +1,112 @@
+name: Fedora 45 RPM repository
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fedora45-pages.yml
+      - patches/**
+      - packaging/fedora/upstream-srpms.sha256
+      - scripts/*.sh
+      - scripts/prepare-copr-srpms.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fedora45-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:45
+    timeout-minutes: 105
+    strategy:
+      matrix:
+        package: [kwin, xdg-desktop-portal-kde]
+    steps:
+      - name: Install packaging tools
+        run: dnf -y install git cpio curl rpm-build python3 'dnf5-command(builddep)'
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Prepare and compile
+        shell: bash
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          bash scripts/download-fedora45-srpms.sh
+          python3 scripts/prepare-copr-srpms.py build/upstream/kwin-*.src.rpm \
+            build/upstream/xdg-desktop-portal-kde-*.src.rpm
+          bash scripts/build-fedora45-rpms.sh "$PACKAGE"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rpm-${{ matrix.package }}
+          path: build/binary/*.rpm
+          if-no-files-found: error
+
+  verify:
+    needs: build
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:45
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rpm-*
+          merge-multiple: true
+          path: rpms
+      - name: Check complete package set and install in disposable Fedora
+        shell: bash
+        run: |
+          diff -u <(printf '%s\n' kwin kwin-common kwin-libs xdg-desktop-portal-kde) \
+            <(rpm -qp --qf '%{NAME}\n' rpms/*.rpm | sort)
+          dnf -y --setopt=install_weak_deps=False install ./rpms/*.rpm
+          rpm -q --whatprovides 'kwin-vdesktop-screencast = 4'
+
+  prepare-pages:
+    if: github.ref == 'refs/heads/main' && vars.RPM_SIGNING_FINGERPRINT != ''
+    needs: verify
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:45
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - run: dnf -y install git gnupg2 rpm-sign createrepo_c
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/configure-pages@v5
+        id: pages
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rpm-*
+          merge-multiple: true
+          path: rpms
+      - name: Sign RPMs and create DNF repository
+        shell: bash
+        env:
+          RPM_SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
+          RPM_SIGNING_FINGERPRINT: ${{ vars.RPM_SIGNING_FINGERPRINT }}
+          PAGES_URL: ${{ steps.pages.outputs.base_url }}
+        run: bash scripts/make-fedora45-repo.sh rpms site "$PAGES_URL"
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  deploy:
+    needs: prepare-pages
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

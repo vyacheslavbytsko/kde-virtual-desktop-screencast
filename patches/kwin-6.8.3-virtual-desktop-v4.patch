@@ -1,0 +1,488 @@
+--- a/src/plugins/screencast/screencastmanager.cpp
++++ b/src/plugins/screencast/screencastmanager.cpp
+@@ -19,6 +19,7 @@
+ #include "wayland/clientconnection.h"
+ #include "wayland/display.h"
+ #include "wayland/output.h"
++#include "virtualdesktops.h"
+ #include "wayland_server.h"
+ #include "window.h"
+ #include "windowscreencastsource.h"
+@@ -34,6 +35,7 @@
+ {
+     getPipewireConnection();
+ 
++    connect(m_screencast, &ScreencastV1Interface::virtualDesktopScreencastRequested, this, &ScreencastManager::streamVirtualDesktop);
+     connect(m_screencast, &ScreencastV1Interface::windowScreencastRequested, this, &ScreencastManager::streamWindow);
+     connect(m_screencast, &ScreencastV1Interface::outputScreencastRequested, this, &ScreencastManager::streamWaylandOutput);
+     connect(m_screencast, &ScreencastV1Interface::virtualOutputScreencastRequested, this, &ScreencastManager::streamVirtualOutput);
+@@ -67,6 +69,29 @@
+     stream->setObjectName(window->desktopFileName());
+     stream->setCursorMode(mode);
+ 
++    integrateStreams(waylandStream, stream);
++}
++
++void ScreencastManager::streamVirtualDesktop(ScreencastStreamV1Interface *waylandStream, const QString &desktopId, OutputInterface *output, ScreencastV1Interface::CursorMode mode)
++{
++    auto desktop = VirtualDesktopManager::self()->desktopForId(desktopId);
++    if (!desktop || !output || output->isRemoved() || !output->handle()
++        || !isSupportedCompositingType() || waylandServer()->isScreenLocked()) {
++        waylandStream->sendFailed(i18n("Could not capture the requested virtual desktop"));
++        return;
++    }
++
++    auto stream = new ScreenCastStream(new WindowScreenCastSource(desktop, output->handle()), getPipewireConnection(), this);
++    stream->setObjectName(desktopId);
++    switch (mode) {
++    case ScreencastV1Interface::Embedded:
++    case ScreencastV1Interface::Metadata:
++        stream->setCursorMode(mode);
++        break;
++    default:
++        stream->setCursorMode(ScreencastV1Interface::Hidden);
++        break;
++    }
+     integrateStreams(waylandStream, stream);
+ }
+ 
+--- a/src/plugins/screencast/screencastmanager.h
++++ b/src/plugins/screencast/screencastmanager.h
+@@ -30,6 +30,7 @@
+     void streamWindow(ScreencastStreamV1Interface *stream,
+                       const QString &winid,
+                       ScreencastV1Interface::CursorMode mode);
++    void streamVirtualDesktop(ScreencastStreamV1Interface *stream, const QString &desktopId, OutputInterface *output, ScreencastV1Interface::CursorMode mode);
+     void streamWaylandOutput(ScreencastStreamV1Interface *stream,
+                              OutputInterface *output,
+                              ScreencastV1Interface::CursorMode mode);
+--- a/src/plugins/screencast/screencaststream.cpp
++++ b/src/plugins/screencast/screencaststream.cpp
+@@ -609,7 +609,8 @@
+         break;
+     case ScreencastV1Interface::Embedded:
+         effectiveContents |= Content::Cursor | Content::Video;
+-        m_source->setRenderCursor(m_source->includesCursor(Cursors::self()->currentCursor()));
++        m_cursor.visible = m_source->includesCursor(Cursors::self()->currentCursor());
++        m_source->setRenderCursor(m_cursor.visible);
+         break;
+     }
+ 
+--- a/src/plugins/screencast/windowscreencastsource.cpp
++++ b/src/plugins/screencast/windowscreencastsource.cpp
+@@ -15,11 +15,17 @@
+ #include "input.h"
+ #include "opengl/glframebuffer.h"
+ #include "opengl/gltexture.h"
++#include "scene/imageitem.h"
+ #include "scene/itemrenderer.h"
+ #include "scene/windowitem.h"
+ #include "scene/workspacescene.h"
++#include "core/output.h"
++#include "virtualdesktops.h"
++#include "wayland_server.h"
+ #include "workspace.h"
+ 
++#include <QPainter>
++#include <QtMath>
+ #include <drm_fourcc.h>
+ 
+ namespace KWin
+@@ -40,6 +46,209 @@
+     });
+ }
+ 
++WindowScreenCastSource::WindowScreenCastSource(VirtualDesktop *desktop, LogicalOutput *output)
++    : ScreenCastSource()
++    , m_desktopPanel(std::make_unique<ImageItem>())
++    , m_desktopCapture(true)
++    , m_desktop(desktop)
++    , m_output(output)
++    , m_desktopViewport(output->geometryF())
++    , m_desktopScale(output->scale())
++    , m_desktopRefreshRate(output->refreshRate())
++{
++    m_desktopUpdate.setSingleShot(true);
++    connect(&m_desktopUpdate, &QTimer::timeout, this, &WindowScreenCastSource::refreshDesktopWindows);
++    connect(workspace(), &Workspace::windowAdded, this, &WindowScreenCastSource::trackDesktopWindow);
++    connect(workspace(), &Workspace::stackingOrderChanged, this, [this] {
++        if (m_active) {
++            m_desktopUpdate.start();
++        }
++    });
++    for (Window *window : workspace()->windows()) {
++        trackDesktopWindow(window);
++    }
++
++    connect(workspace(), &Workspace::currentDesktopChanged, this, &WindowScreenCastSource::frame);
++    connect(Cursors::self(), &Cursors::hiddenChanged, this, &WindowScreenCastSource::frame);
++    connect(Cursors::self(), &Cursors::currentCursorChanged, this, &WindowScreenCastSource::frame);
++    connect(workspace(), &Workspace::currentActivityChanged, this, &WindowScreenCastSource::closed);
++    connect(VirtualDesktopManager::self(), &VirtualDesktopManager::desktopRemoved, this, [this](VirtualDesktop *removed) {
++        if (removed == m_desktop) {
++            m_desktop = nullptr;
++            Q_EMIT closed();
++        }
++    });
++    connect(workspace(), &Workspace::outputRemoved, this, [this](LogicalOutput *removed) {
++        if (removed == m_output) {
++            m_output = nullptr;
++            Q_EMIT closed();
++        }
++    });
++    connect(output, &LogicalOutput::changed, this, &WindowScreenCastSource::closed);
++    connect(waylandServer(), &WaylandServer::lockStateChanged, this, &WindowScreenCastSource::closed);
++}
++
++Window *WindowScreenCastSource::desktopSurface() const
++{
++    return m_desktop && m_output && !waylandServer()->isScreenLocked()
++        ? workspace()->findDesktop(m_desktop, m_output)
++        : nullptr;
++}
++
++bool WindowScreenCastSource::isDesktopTask(Window *window) const
++{
++    return m_desktop && m_output && !waylandServer()->isScreenLocked()
++        && window->readyForPainting() && !window->isDeleted() && !window->isHidden()
++        && window->isOnDesktop(m_desktop) && !window->isOnAllDesktops()
++        && window->isOnCurrentActivity() && window->isOnOutput(m_output)
++        && !window->excludeFromCapture() && !window->isInternal()
++        && (window->isNormalWindow() || window->isDialog());
++}
++
++bool WindowScreenCastSource::includesDesktopWindow(Window *window, Window *background) const
++{
++    if (window == background) {
++        return window->readyForPainting() && window->isOnCurrentActivity()
++            && !window->excludeFromCapture() && !window->isInternal();
++    }
++    return !window->isMinimized() && isDesktopTask(window);
++}
++
++void WindowScreenCastSource::trackDesktopWindow(Window *window)
++{
++    const auto scheduleUpdate = [this, window] {
++        if (m_active && (m_windows.contains(window) || m_desktopTasks.contains(window)
++                         || isDesktopTask(window) || window == desktopSurface())) {
++            m_desktopUpdate.start();
++        }
++    };
++    connect(window, &Window::readyForPaintingChanged, this, scheduleUpdate);
++    connect(window, &Window::desktopsChanged, this, scheduleUpdate);
++    connect(window, &Window::activitiesChanged, this, scheduleUpdate);
++    connect(window, &Window::frameGeometryChanged, this, scheduleUpdate);
++    connect(window, &Window::outputChanged, this, scheduleUpdate);
++    connect(window, &Window::minimizedChanged, this, scheduleUpdate);
++    connect(window, &Window::hiddenChanged, this, scheduleUpdate);
++    connect(window, &Window::excludeFromCaptureChanged, this, scheduleUpdate);
++    connect(window, &Window::opacityChanged, this, scheduleUpdate);
++    connect(window, &Window::iconChanged, this, scheduleUpdate);
++    connect(window, &Window::closed, this, [this, window] {
++        const bool removedTask = m_desktopTasks.removeOne(window);
++        const bool removedWindow = m_windows.removeOne(window);
++        if (removedWindow) {
++            unwatch(window);
++        }
++        if (removedTask || removedWindow) {
++            m_desktopUpdate.start();
++        }
++    });
++    scheduleUpdate();
++}
++
++void WindowScreenCastSource::refreshDesktopWindows()
++{
++    if (!m_active) {
++        return;
++    }
++
++    Window *const background = desktopSurface();
++    QList<Window *> windows;
++    for (Window *window : workspace()->stackingOrder()) {
++        if (includesDesktopWindow(window, background)) {
++            windows.append(window);
++        }
++    }
++
++    for (Window *window : std::as_const(m_windows)) {
++        if (!windows.contains(window)) {
++            unwatch(window);
++        }
++    }
++    for (Window *window : std::as_const(windows)) {
++        if (!m_windows.contains(window)) {
++            watch(window);
++        }
++    }
++    m_windows = std::move(windows);
++    m_desktopTasks.clear();
++    for (Window *window : workspace()->windows()) {
++        if (isDesktopTask(window)) {
++            m_desktopTasks.append(window);
++        }
++    }
++    Q_EMIT frame();
++}
++
++void WindowScreenCastSource::updateDesktopPanel()
++{
++    constexpr int margin = 8;
++    constexpr int tile = 40;
++    constexpr int inset = 6;
++    constexpr int height = tile + 2 * inset;
++    const int capacity = (qFloor(m_desktopViewport.width()) - 2 * (margin + inset)) / tile;
++    QList<QIcon> icons;
++    QList<qint64> keys;
++    if (capacity > 0) {
++        for (Window *window : std::as_const(m_desktopTasks)) {
++            if (isDesktopTask(window)) {
++                icons.append(window->icon());
++                keys.append(window->icon().cacheKey());
++            }
++        }
++    }
++    if (keys == m_panelIconKeys) {
++        return;
++    }
++    m_panelIconKeys = std::move(keys);
++    if (icons.isEmpty()) {
++        m_desktopPanel->setImage(QImage());
++        m_desktopPanel->setSize(QSizeF(0, 0));
++        return;
++    }
++
++    const int slots = std::min(capacity, int(icons.size()));
++    const bool overflow = icons.size() > slots;
++    const int visibleIcons = overflow ? slots - 1 : slots;
++    const int width = slots * tile + 2 * inset;
++    QImage image((QSizeF(width, height) * m_desktopScale).toSize(), QImage::Format_ARGB32_Premultiplied);
++    if (image.isNull()) {
++        m_desktopPanel->setImage(QImage());
++        m_desktopPanel->setSize(QSizeF(0, 0));
++        m_panelIconKeys.clear();
++        return;
++    }
++    image.setDevicePixelRatio(m_desktopScale);
++    image.fill(Qt::transparent);
++
++    QPainter painter(&image);
++    painter.setRenderHint(QPainter::Antialiasing);
++    painter.setPen(Qt::NoPen);
++    painter.setBrush(QColor(32, 35, 43, 242));
++    painter.drawRoundedRect(QRectF(0, 0, width, height), 12, 12);
++    const QIcon fallback = QIcon::fromTheme(QStringLiteral("application-x-executable"));
++    for (int index = 0; index < visibleIcons; ++index) {
++        const QRect iconRect(inset + index * tile + 7, inset + 7, 26, 26);
++        const QIcon &icon = icons[index].isNull() ? fallback : icons[index];
++        if (icon.isNull()) {
++            painter.setBrush(QColor(224, 227, 233));
++            painter.drawRoundedRect(iconRect.adjusted(4, 6, -4, -6), 3, 3);
++        } else {
++            icon.paint(&painter, iconRect);
++        }
++    }
++    if (overflow) {
++        painter.setPen(Qt::white);
++        painter.drawText(QRect(inset + visibleIcons * tile, inset, tile, tile),
++                         Qt::AlignCenter, QStringLiteral("+%1").arg(icons.size() - visibleIcons));
++    }
++    painter.end();
++
++    m_desktopPanel->setPosition(QPointF(m_desktopViewport.x() + (m_desktopViewport.width() - width) / 2,
++                                         m_desktopViewport.y() + m_desktopViewport.height() - height - margin));
++    m_desktopPanel->setSize(QSizeF(width, height));
++    m_desktopPanel->setImage(image);
++}
++
+ WindowScreenCastSource::~WindowScreenCastSource()
+ {
+     pause();
+@@ -91,12 +300,12 @@
+ 
+ QSize WindowScreenCastSource::textureSize() const
+ {
+-    return (boundingRect().size() * m_windows[0]->targetScale()).toSize();
++    return (boundingRect().size() * devicePixelRatio()).toSize();
+ }
+ 
+ qreal WindowScreenCastSource::devicePixelRatio() const
+ {
+-    return m_windows[0]->targetScale();
++    return m_desktopCapture ? m_desktopScale : m_windows[0]->targetScale();
+ }
+ 
+ void WindowScreenCastSource::setRenderCursor(bool enable)
+@@ -132,10 +341,23 @@
+     auto renderer = scene->renderer(m_renderDevice);
+ 
+     renderer->beginFrame(renderTarget, viewport);
+-    glClearColor(0.0, 0.0, 0.0, 0.0);
++    glClearColor(0.0, 0.0, 0.0, m_desktopCapture ? 1.0 : 0.0);
+     glClear(GL_COLOR_BUFFER_BIT);
+-    for (const auto &window : m_windows) {
++    Window *const background = m_desktopCapture ? desktopSurface() : nullptr;
++    for (Window *window : m_windows) {
++        if (m_desktopCapture && !includesDesktopWindow(window, background)) {
++            continue;
++        }
+         if (!renderer->renderItem(renderTarget, viewport, window->windowItem(), Scene::PAINT_WINDOW_TRANSFORMED, Region::infinite(), WindowPaintData{}, {}, {})) {
++            return {};
++        }
++    }
++    if (m_desktopPanel) {
++        updateDesktopPanel();
++        if (!m_panelIconKeys.isEmpty()
++            && !renderer->renderItem(renderTarget, viewport, m_desktopPanel.get(), Scene::PAINT_WINDOW_TRANSFORMED,
++                                     Region::infinite(), WindowPaintData{}, {}, {})) {
++            renderer->endFrame();
+             return {};
+         }
+     }
+@@ -150,7 +372,7 @@
+ 
+ uint WindowScreenCastSource::refreshRate() const
+ {
+-    return m_windows[0]->output()->refreshRate();
++    return m_desktopCapture ? m_desktopRefreshRate : m_windows[0]->output()->refreshRate();
+ }
+ 
+ void WindowScreenCastSource::pause()
+@@ -163,11 +385,22 @@
+         unwatch(window);
+     }
+     m_active = false;
++    if (m_desktopCapture) {
++        m_desktopUpdate.stop();
++        m_windows.clear();
++        m_desktopTasks.clear();
++    }
+ }
+ 
+ void WindowScreenCastSource::resume()
+ {
+     if (m_active) {
++        return;
++    }
++
++    m_active = true;
++    if (m_desktopCapture) {
++        refreshDesktopWindows();
+         return;
+     }
+ 
+@@ -175,14 +408,18 @@
+         watch(window);
+     }
+     Q_EMIT frame();
+-
+-    m_active = true;
+ }
+ 
+ bool WindowScreenCastSource::includesCursor(Cursor *cursor) const
+ {
+-    if (Cursors::self()->isCursorHidden()) {
++    if (!cursor || Cursors::self()->isCursorHidden()) {
+         return false;
++    }
++
++    if (m_desktopCapture) {
++        return m_desktop && m_output && !waylandServer()->isScreenLocked()
++            && m_desktopViewport.contains(cursor->pos())
++            && VirtualDesktopManager::self()->currentDesktop(m_output) == m_desktop;
+     }
+ 
+     if (!boundingRect().intersects(cursor->geometry())) {
+@@ -204,6 +441,9 @@
+ 
+ RectF WindowScreenCastSource::boundingRect() const
+ {
++    if (m_desktopCapture) {
++        return m_desktopViewport;
++    }
+     RectF boundingRect;
+     for (const auto &window : m_windows) {
+         boundingRect = boundingRect.united(window->frameGeometry());
+--- a/src/plugins/screencast/windowscreencastsource.h
++++ b/src/plugins/screencast/windowscreencastsource.h
+@@ -15,12 +15,17 @@
+ namespace KWin
+ {
+ 
++class ImageItem;
++class LogicalOutput;
++class VirtualDesktop;
++
+ class WindowScreenCastSource : public ScreenCastSource
+ {
+     Q_OBJECT
+ 
+ public:
+     explicit WindowScreenCastSource(Window *window);
++    WindowScreenCastSource(VirtualDesktop *desktop, LogicalOutput *output);
+     ~WindowScreenCastSource() override;
+ 
+     quint32 drmFormat() const override;
+@@ -47,7 +52,24 @@
+     void unwatch(Window *window);
+     RectF boundingRect() const;
+ 
++    void trackDesktopWindow(Window *window);
++    void refreshDesktopWindows();
++    Window *desktopSurface() const;
++    bool isDesktopTask(Window *window) const;
++    void updateDesktopPanel();
++    bool includesDesktopWindow(Window *window, Window *background) const;
++
+     QList<Window *> m_windows;
++    QList<Window *> m_desktopTasks;
++    QList<qint64> m_panelIconKeys;
++    std::unique_ptr<ImageItem> m_desktopPanel;
++    bool m_desktopCapture = false;
++    VirtualDesktop *m_desktop = nullptr;
++    LogicalOutput *m_output = nullptr;
++    QTimer m_desktopUpdate;
++    RectF m_desktopViewport;
++    qreal m_desktopScale = 1;
++    uint m_desktopRefreshRate = 0;
+     bool m_active = false;
+     bool m_renderCursor = false;
+ };
+--- a/src/wayland/screencast_v1.cpp
++++ b/src/wayland/screencast_v1.cpp
+@@ -16,7 +16,7 @@
+ namespace KWin
+ {
+ 
+-static int s_version = 6;
++static int s_version = 8;
+ 
+ class ScreencastStreamV1InterfacePrivate : public QtWaylandServer::zkde_screencast_stream_unstable_v1
+ {
+@@ -149,6 +149,16 @@
+                                             ScreencastV1Interface::CursorMode(pointer));
+     }
+ 
++    void zkde_screencast_unstable_v1_stream_virtual_desktop(Resource *resource, uint32_t streamid, const QString &desktopId, struct ::wl_resource *output) override
++    {
++        Q_EMIT q->virtualDesktopScreencastRequested(createStream(resource, streamid), desktopId, OutputInterface::get(output), ScreencastV1Interface::Hidden);
++    }
++
++    void zkde_screencast_unstable_v1_stream_virtual_desktop_with_cursor(Resource *resource, uint32_t streamid, const QString &desktopId, struct ::wl_resource *output, uint32_t pointer) override
++    {
++        Q_EMIT q->virtualDesktopScreencastRequested(createStream(resource, streamid), desktopId, OutputInterface::get(output), ScreencastV1Interface::CursorMode(pointer));
++    }
++
+     void zkde_screencast_unstable_v1_destroy(Resource *resource) override
+     {
+         wl_resource_destroy(resource->handle);
+--- a/src/wayland/screencast_v1.h
++++ b/src/wayland/screencast_v1.h
+@@ -66,6 +66,7 @@
+ Q_SIGNALS:
+     void outputScreencastRequested(ScreencastStreamV1Interface *stream, OutputInterface *output, CursorMode mode);
+     void virtualOutputScreencastRequested(ScreencastStreamV1Interface *stream, const QString &name, const QString &description, const QSize &size, double scaling, CursorMode mode);
++    void virtualDesktopScreencastRequested(ScreencastStreamV1Interface *stream, const QString &desktopId, OutputInterface *output, CursorMode mode);
+     void windowScreencastRequested(ScreencastStreamV1Interface *stream, const QString &winid, CursorMode mode);
+     void regionScreencastRequested(ScreencastStreamV1Interface *stream, const Rect &geometry, qreal scaling, CursorMode mode);
+ 
