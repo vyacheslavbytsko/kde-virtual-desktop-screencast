@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '17 4 * * *'
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/watch-fedora45.yml
+      - scripts/update-fedora45-source-pins.py
 
 permissions:
   contents: write
@@ -32,7 +37,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          if git diff --quiet -- packaging/fedora/upstream-srpms.sha256; then
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          changed=$(git status --porcelain -- packaging/fedora/upstream-srpms.sha256)
+          if [[ -z $changed ]]; then
             echo 'The Fedora source packages are already up to date.'
             exit 0
           fi
