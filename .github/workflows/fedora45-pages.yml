@@ -94,7 +94,8 @@ jobs:
             exit 1
           fi
           dnf -y --setopt=install_weak_deps=False install ./rpms/*.rpm
-          rpm -q --whatprovides 'kwin-vdesktop-screencast = 4'
+          rpm -q --provides kwin | grep -Fx 'kwin-vdesktop-screencast = 4'
+          rpm -q --requires xdg-desktop-portal-kde | grep -Fx 'kwin-vdesktop-screencast = 4'
 
   prepare-pages:
     if: >-
