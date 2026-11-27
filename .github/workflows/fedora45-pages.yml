@@ -4,15 +4,20 @@ on:
   push:
     branches: [main]
     paths:
-      - .github/workflows/fedora45-pages.yml
       - patches/**
       - packaging/fedora/upstream-srpms.sha256
       - scripts/*.sh
       - scripts/prepare-copr-srpms.py
   workflow_dispatch:
+    inputs:
+      reuse_first_build:
+        description: Reuse RPMs from the first Fedora 45 build
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: fedora45-pages
@@ -20,6 +25,7 @@ concurrency:
 
 jobs:
   build:
+    if: "!inputs.reuse_first_build"
     runs-on: ubuntu-latest
     container: registry.fedoraproject.org/fedora:45
     timeout-minutes: 105
@@ -49,25 +55,51 @@ jobs:
 
   verify:
     needs: build
+    if: >-
+      !cancelled() && (needs.build.result == 'success' ||
+      (inputs.reuse_first_build && needs.build.result == 'skipped' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     container: registry.fedoraproject.org/fedora:45
     timeout-minutes: 30
     steps:
+      - name: Install Git for checking previously built RPMs
+        if: inputs.reuse_first_build
+        run: dnf -y install git
+      - uses: actions/checkout@v7
+        if: inputs.reuse_first_build
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify the RPM inputs still match the first build
+        if: inputs.reuse_first_build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git diff --exit-code 523615e4e6cde10c4af991f60163af6d33a80e25 HEAD -- \
+            patches packaging/fedora/upstream-srpms.sha256 \
+            scripts/build-fedora45-rpms.sh scripts/download-fedora45-srpms.sh scripts/prepare-copr-srpms.py
       - uses: actions/download-artifact@v8
         with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.reuse_first_build && '45625605705' || github.run_id }}
           pattern: rpm-*
           merge-multiple: true
           path: rpms
       - name: Check complete package set and install in disposable Fedora
         shell: bash
         run: |
-          diff -u <(printf '%s\n' kwin kwin-common kwin-libs xdg-desktop-portal-kde) \
-            <(rpm -qp --qf '%{NAME}\n' rpms/*.rpm | sort)
+          expected=$(printf '%s\n' kwin kwin-common kwin-libs xdg-desktop-portal-kde)
+          actual=$(rpm -qp --qf '%{NAME}\n' rpms/*.rpm | LC_ALL=C sort)
+          if [[ $actual != "$expected" ]]; then
+            printf 'Unexpected RPMs in build output:\n%s\n' "$actual" >&2
+            exit 1
+          fi
           dnf -y --setopt=install_weak_deps=False install ./rpms/*.rpm
           rpm -q --whatprovides 'kwin-vdesktop-screencast = 4'
 
   prepare-pages:
-    if: github.ref == 'refs/heads/main' && vars.RPM_SIGNING_FINGERPRINT != ''
+    if: >-
+      !cancelled() && needs.verify.result == 'success' &&
+      github.ref == 'refs/heads/main' && vars.RPM_SIGNING_FINGERPRINT != ''
     needs: verify
     runs-on: ubuntu-latest
     container: registry.fedoraproject.org/fedora:45
@@ -75,6 +107,7 @@ jobs:
     permissions:
       contents: read
       pages: read
+      actions: read
     steps:
       - run: dnf -y install git gnupg2 rpm-sign createrepo_c
       - uses: actions/checkout@v7
@@ -84,6 +117,8 @@ jobs:
         id: pages
       - uses: actions/download-artifact@v8
         with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.reuse_first_build && '45625605705' || github.run_id }}
           pattern: rpm-*
           merge-multiple: true
           path: rpms
@@ -99,6 +134,7 @@ jobs:
           path: site
 
   deploy:
+    if: "!cancelled() && needs.prepare-pages.result == 'success'"
     needs: prepare-pages
     runs-on: ubuntu-latest
     permissions:
