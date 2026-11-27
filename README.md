@@ -1,33 +1,46 @@
 # KDE virtual desktop screencast
 
-Экспериментальная сборка v4 для Fedora 45 x86_64 и KDE Plasma 6.8.3 (Wayland). В системном диалоге демонстрации можно выбрать конкретный виртуальный рабочий стол и монитор. При локальном переключении поток продолжает показывать выбранный стол.
+An experimental build for Fedora 45 x86_64 and KDE Plasma 6.8.3 on Wayland. In the system screen-sharing dialog, select a virtual desktop and a monitor. The stream keeps showing the selected desktop when you switch desktops locally.
 
-В v4 захватываются фон Plasma, окна и диалоги выбранного стола. Панель в кадре показывает значки открытых и свёрнутых окон этого стола. Настоящий курсор KWin передаётся по запросу приложения, пока выбранный стол активен на выбранном мониторе. Встроенная панель трансляции не включает виджеты штатной панели Plasma.
+The stream captures the Plasma wallpaper, windows, and dialogs on the selected desktop. Its task panel shows icons for open and minimized windows on that desktop. If the application requests a cursor, KWin includes it while the selected desktop is active on the selected monitor. Plasma panel widgets are outside the captured content.
 
-## Обновления Fedora 45 x86_64
+## Updates for Fedora 45 x86_64
 
-GitHub Actions собирает `kwin`, `kwin-common`, `kwin-libs` и `xdg-desktop-portal-kde`, проверяет их совместную установку в отдельном контейнере и публикует подписанный репозиторий на [GitHub Pages](https://vyacheslavbytsko.github.io/kde-virtual-desktop-screencast/). Патч v4 применяется в обоих исходных пакетах, а общий XML-протокол встраивается при сборке. PipeWire и пакеты протоколов на ноутбуке обновляются обычным способом.
+GitHub Actions builds patched versions of `kwin`, `kwin-common`, `kwin-libs`, and `xdg-desktop-portal-kde`, checks that they install together in a container, and publishes a signed repository on [GitHub Pages](https://vyacheslavbytsko.github.io/kde-virtual-desktop-screencast/). Both source packages use the same patched Wayland XML protocol at build time. PipeWire and the system protocol packages can be updated through Fedora as usual.
 
-После первого успешного выпуска скачай `kde-virtual-desktop.repo` со страницы проекта и установи его командой `sudo dnf config-manager addrepo --from-repofile=./kde-virtual-desktop.repo`. При первом обновлении сверь отпечаток ключа с переменной `RPM_SIGNING_FINGERPRINT` в настройках Actions.
+1. Download [kde-virtual-desktop.repo](https://vyacheslavbytsko.github.io/kde-virtual-desktop-screencast/kde-virtual-desktop.repo) and run the following command from the download directory.
 
-Исключи четыре пакета только из штатных репозиториев Fedora. Если списки исключений пустые, их можно задать так:
+   ```bash
+   sudo dnf config-manager addrepo --from-repofile=./kde-virtual-desktop.repo
+   ```
 
-```bash
-sudo dnf config-manager setopt \
-  fedora.excludepkgs=kwin,kwin-common,kwin-libs,xdg-desktop-portal-kde \
-  updates.excludepkgs=kwin,kwin-common,kwin-libs,xdg-desktop-portal-kde
-```
+2. Exclude the four packages from the standard Fedora repositories so DNF gets them from the patched repository. If you have no existing exclusions in `fedora` or `updates`, use the following command.
 
-Если уже есть исключения, дополни их. Если включён `updates-testing`, добавь эти имена и в него. Затем выполни `sudo dnf upgrade --refresh` и перезайди в сеанс Plasma.
+   ```bash
+   sudo dnf config-manager setopt \
+     fedora.excludepkgs=kwin,kwin-common,kwin-libs,xdg-desktop-portal-kde \
+     updates.excludepkgs=kwin,kwin-common,kwin-libs,xdg-desktop-portal-kde
+   ```
 
-### Выпуск новой сборки
+   If you already have exclusions, append these package names to your existing lists. Add them to `updates-testing` as well if that repository is enabled.
 
-Каждый день GitHub Actions проверяет стабильные репозитории Fedora 45. Если Fedora выпустила новую ревизию и для обеих версий есть патчи, Actions обновляет список исходных RPM и запускает сборку. Когда для новой Plasma ещё нет патча, проверка останавливается. После переноса патчей можно запустить проверку вручную. Список исходных RPM с контрольными суммами хранится в `packaging/fedora/upstream-srpms.sha256`. Для повторной публикации той же ревизии увеличь номер `--revision` в скрипте подготовки. GitHub Actions начнёт сборку после изменения в `main`. Также её можно запустить вручную во вкладке **Actions → Fedora 45 RPM repository**. При ошибке сборки или проверки установки Pages продолжит раздавать предыдущую версию.
+3. Run `sudo dnf upgrade --refresh`. When DNF prompts you to import the signing key, compare its fingerprint with `RPM_SIGNING_FINGERPRINT` in the repository's Actions settings. After updating, log out of Plasma and log back in.
 
-Для публикации используются **Settings → Pages → GitHub Actions**, секрет Actions `RPM_SIGNING_KEY` с закрытым ключом OpenPGP и переменная Actions `RPM_SIGNING_FINGERPRINT` с его полным отпечатком. Проверка установки в контейнере подтверждает совместимость RPM. Сам захват виртуального стола проверяется в сеансе Plasma.
+### Publishing an update
 
-## Источники и лицензии
+GitHub Actions checks the stable Fedora 45 repositories daily. When Fedora publishes a newer revision and patches are available for both source package versions, the workflow updates `packaging/fedora/upstream-srpms.sha256` with the source RPM names and checksums and starts a build. If patches are missing for a new Plasma release, the check stops. Once the patches have been ported, you can run the check manually.
 
-Патчи применяются к [KWin](https://invent.kde.org/plasma/kwin/-/tree/v6.8.3), [KDE Portal](https://invent.kde.org/plasma/xdg-desktop-portal-kde/-/tree/v6.8.3) и Wayland-протоколам Plasma версии 1.23.0. Изменения в исходных файлах распространяются на условиях лицензий этих файлов, указанных в их SPDX-заголовках. Соответствующие тексты лежат в `LICENSES/`.
+Changes to the build inputs on `main` also trigger a build. You can start one manually under **Actions → Fedora 45 RPM repository**. To republish the same Fedora revision, increase the `--revision` value in the package preparation script. If the build or installation check fails, GitHub Pages continues serving the previous release.
 
-Пакетные рецепты берутся из исходных RPM Fedora Koji, перечисленных в `packaging/fedora/upstream-srpms.sha256`. Скрипт сборки и тестовая HTML-страница доступны по GPL-2.0-or-later.
+Publishing uses **Settings → Pages → GitHub Actions**, the `RPM_SIGNING_KEY` Actions secret containing the OpenPGP private key, and the `RPM_SIGNING_FINGERPRINT` Actions variable containing its full fingerprint. The container check verifies that the RPMs install together. Test virtual desktop capture in a Plasma session.
+
+## Authors
+
+- [vyacheslavbytsko](https://github.com/vyacheslavbytsko), project lead and Plasma testing.
+- OpenAI Codex, patch implementation, RPM packaging, and GitHub Actions.
+
+## Sources and licenses
+
+The patches apply to [KWin](https://invent.kde.org/plasma/kwin/-/tree/v6.8.3), [KDE Portal](https://invent.kde.org/plasma/xdg-desktop-portal-kde/-/tree/v6.8.3), and Plasma Wayland Protocols 1.23.0. Changes to source files are distributed under the licenses identified by their SPDX headers. The license texts are in `LICENSES/`.
+
+Packaging recipes come from the Fedora Koji source RPMs listed in `packaging/fedora/upstream-srpms.sha256`. The build script and HTML test page are available under GPL-2.0-or-later.
