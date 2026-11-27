@@ -26,11 +26,6 @@ These experimental packages target KDE Plasma 6.8.3. The signed [DNF repository]
 
 3. Run `sudo dnf upgrade --refresh`. If prompted to import the signing key, check that its fingerprint is `7272 6946 C328 DA0A BAB9 9479 6097 318B DD2B 6A3E`. Log out of Plasma and log back in to start sharing.
 
-## Authors
-
-- [vyacheslavbytsko](https://github.com/vyacheslavbytsko), project lead and Plasma testing.
-- OpenAI Codex, patch implementation, RPM packaging, and GitHub Actions.
-
 ## Licenses
 
 The KWin, KDE Portal, and Plasma Wayland Protocols patches follow the SPDX license headers of the files they modify. See [LICENSES](LICENSES/). The build script and HTML test page are available under GPL-2.0-or-later.
